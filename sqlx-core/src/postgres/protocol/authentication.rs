@@ -1,6 +1,9 @@
 use crate::io::Buf;
 use crate::postgres::protocol::Decode;
 use byteorder::NetworkEndian;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use std::borrow::Cow;
 use std::io;
 
 #[derive(Debug)]
@@ -36,10 +39,18 @@ pub enum Authentication {
     Sasl { mechanisms: Box<[Box<str>]> },
 
     /// This message contains a SASL challenge.
-    SaslContinue { data: Box<[u8]> },
+    SaslContinue(SaslContinue),
 
     /// SASL authentication has completed.
     SaslFinal { data: Box<[u8]> },
+}
+
+#[derive(Debug)]
+pub struct SaslContinue {
+    pub salt: Vec<u8>,
+    pub iter_count: u32,
+    pub nonce: Vec<u8>,
+    pub data: String,
 }
 
 impl Decode for Authentication {
@@ -86,12 +97,40 @@ impl Decode for Authentication {
             }
 
             11 => {
-                let mut data = Vec::with_capacity(buf.len());
-                data.extend_from_slice(buf);
+                let mut salt: Vec<u8> = Vec::new();
+                let mut nonce: Vec<u8> = Vec::new();
+                let mut iter_count: u32 = 0;
 
-                Authentication::SaslContinue {
-                    data: data.into_boxed_slice(),
-                }
+                println!("{:?}", hex::encode(buf));
+
+                buf.split(|byte| *byte == b',')
+                    .map(|s| {
+                        let (key, value) = s.split_at(1);
+                        let value = value.split_at(1).1;
+
+                        (key[0] as char, value)
+                    })
+                    .for_each(|(key, value)| match key {
+                        's' => salt = value.to_vec(),
+                        'r' => nonce = value.to_vec(),
+                        'i' => {
+                            iter_count = u32::from_str_radix(&String::from_utf8_lossy(&value), 10)
+                                .unwrap_or(0);
+                        }
+
+                        _ => {}
+                    });
+
+                println!("[hi] salt: {:?}", String::from_utf8_lossy(&salt));
+                println!("[hi] nonce: {:?}", String::from_utf8_lossy(&nonce));
+                println!("[hi] iter_count: {:?}", iter_count);
+
+                Authentication::SaslContinue(SaslContinue {
+                    salt: base64::decode(&salt).unwrap(),
+                    nonce,
+                    iter_count,
+                    data: String::from_utf8_lossy(buf).into_owned(),
+                })
             }
 
             12 => {
@@ -108,6 +147,28 @@ impl Decode for Authentication {
             }
         })
     }
+}
+
+// Hi(str, salt, i):
+pub fn hi<T: AsRef<str>>(s: T, salt: Vec<u8>, iter_count: u32) -> Vec<u8> {
+    let mut mac =
+        Hmac::<Sha256>::new_varkey(s.as_ref().as_bytes()).expect("HMAC can take key of any size");
+
+    mac.input(&salt);
+    mac.input(&1u32.to_be_bytes());
+
+    let mut u = mac.result().code();
+    let mut hi = u;
+
+    for _ in 1..iter_count {
+        let mut mac = Hmac::<Sha256>::new_varkey(s.as_ref().as_bytes())
+            .expect("HMAC can take key of any size");
+        mac.input(u.as_slice());
+        u = mac.result().code();
+        hi = hi.iter().zip(u.iter()).map(|(&a, &b)| a ^ b).collect();
+    }
+
+    hi.to_vec()
 }
 
 #[cfg(test)]

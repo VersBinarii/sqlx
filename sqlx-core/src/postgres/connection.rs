@@ -7,9 +7,11 @@ use futures_core::future::BoxFuture;
 use crate::cache::StatementCache;
 use crate::connection::Connection;
 use crate::io::{Buf, BufStream};
-use crate::postgres::protocol::{self, Decode, Encode, Message, StatementId};
+use crate::postgres::protocol::{self, Decode, Encode, Message, StatementId, hi};
 use crate::postgres::PgError;
 use crate::url::Url;
+use sha2::{Digest, Sha256};
+use hmac::{Hmac, Mac};
 
 /// An asynchronous connection to a [Postgres] database.
 ///
@@ -90,6 +92,123 @@ impl PgConnection {
                             .encode(self.stream.buffer_mut());
 
                             self.stream.flush().await?;
+                        }
+
+                        protocol::Authentication::Sasl { mechanisms } => {
+                            println!("[sasl]");
+
+                            let gs2_c_bind_flag = "n";
+                            let gs2_header = format!("{gs2_c_bind_flag},,", gs2_c_bind_flag = gs2_c_bind_flag);
+                            let channel_binding = format!("c={}", base64::encode(&gs2_header));
+                            let username = "n=daniel".to_owned();
+                            let nonce = "r=fyko+d2lbbFgONRv9qkxdawL".to_owned();
+                            let client_first_message_bare = format!("{username},{nonce}", username = username, nonce = nonce);
+                            let client_first_message = format!("{gs2_header}{client_first_message_bare}", 
+                                gs2_header = gs2_header,
+                                client_first_message_bare = client_first_message_bare);
+                            println!("[sasl] channel_binding: {}", channel_binding);
+                            println!("[sasl] gs2_c_bind_flag: {}", gs2_c_bind_flag);
+                            println!("[sasl] gs2_header: {}", gs2_header);
+                            println!("[sasl] username: {}", username);
+                            println!("[sasl] nonce: {}", nonce);
+                            println!("[sasl] client_first_message_bare: {}", client_first_message_bare);
+                            println!("[sasl] client_first_message: {}", client_first_message);
+
+                            // https://tools.ietf.org/html/rfc5802#section-1
+                            // gs2-header = gs2-cbind-flag "," [ authzid ] ","
+                            // ;; GS2 header for SCRAM
+                            // ;; (the actual GS2 header includes an optional
+                            // ;; flag to indicate that the GSS mechanism is not
+                            // ;; "standard", but since SCRAM is "standard", we
+                            // ;; don't include that flag).
+
+                            // channel-binding = "c=" base64
+                            // ;; base64 encoding of cbind-input.
+
+                            // cbind-input = gs2-header [ cbind-data ]
+                            // ;; cbind-data MUST be present for
+                            // ;; gs2-cbind-flag of "p" and MUST be absent
+                            // ;; for "y" or "n".
+
+                            // client-final-message-without-proof =
+                            // channel-binding "," nonce [","
+                            // extensions]
+
+                            protocol::SaslInitialResponse { s: client_first_message }.encode(self.stream.buffer_mut());
+                            self.stream.flush().await?;
+                            let server_first_message = self.receive().await?;
+
+                            if let Some(Message::Authentication(auth)) = server_first_message {
+                                if let protocol::Authentication::SaslContinue(sasl) = *auth {
+                                    println!("[sasl] {:?}\n", sasl);
+                                    // let server_first_message = sasl.data;
+                                    // let sasl = protocol::SaslContinue {
+                                    //     salt: "QSXCR+Q6sek8bf92".as_bytes().into(),
+                                    //     iter_count: 4096,
+                                    //     nonce: "fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j".as_bytes().into(),
+                                    //     data: "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096".to_owned(),
+                                    // };
+                                    let server_first_message = sasl.data;
+
+                                    // Salted Password
+                                    let salted_password = hi("password1", sasl.salt, sasl.iter_count);
+                                    println!("[sasl] salted_password: {:?}\n", salted_password);
+
+                                    // Client Key
+                                    let mut mac = 
+                                        Hmac::<Sha256>::new_varkey(&salted_password).expect("HMAC can take key of any size");
+                                    mac.input(b"Client Key");
+                                    let client_key = mac.result().code();
+                                    println!("[sasl] client_key: {:?}\n", client_key);
+
+                                    // Stored Key
+                                    let mut hasher = Sha256::new();
+                                    hasher.input(client_key);
+                                    let stored_key = hasher.result();
+                                    println!("[sasl] stored_key: {:?}\n", stored_key);
+
+                                    let client_final_message_wo_proof = format!("{channel_binding},r={nonce}", 
+                                        channel_binding = channel_binding,
+                                        nonce = String::from_utf8_lossy(&sasl.nonce));
+                                    println!("[sasl] client_final_message_wo_proof: {}\n", client_final_message_wo_proof);
+
+                                    let auth_message = format!("{client_first_message_bare},{server_first_message},{client_final_message_wo_proof}", 
+                                        client_first_message_bare = client_first_message_bare,
+                                        server_first_message = server_first_message,
+                                        client_final_message_wo_proof = client_final_message_wo_proof);
+                                    println!("[sasl] auth_message: {}\n", auth_message);
+
+                                    let mut mac = 
+                                        Hmac::<Sha256>::new_varkey(&stored_key).expect("HMAC can take key of any size");
+                                    mac.input(&auth_message.as_bytes());
+                                    let client_signature = mac.result().code();
+                                    println!("[sasl] client_signature: {:?}\n", client_signature.as_slice());
+
+                                    let client_proof: Vec<u8> = client_key.iter().zip(client_signature.iter()).map(|(&a, &b)| a ^ b).collect();
+                                    println!("[sasl] client_proof: {:?}\n", client_proof);
+
+                                    let mut mac = 
+                                        Hmac::<Sha256>::new_varkey(&salted_password).expect("HMAC can take key of any size");
+                                    mac.input(b"Server Key");
+                                    let server_key = mac.result().code();
+                                    println!("[sasl] server_key: {:?}\n", server_key);
+
+                                    let mut mac = 
+                                        Hmac::<Sha256>::new_varkey(&server_key).expect("HMAC can take key of any size");
+                                    mac.input(&auth_message.as_bytes());
+                                    let server_signature = mac.result().code();
+                                    println!("[sasl] server_signature: {:?}\n", server_signature);
+
+                                    let client_final_message = format!("{client_final_message_wo_proof},p={client_proof}",
+                                        client_final_message_wo_proof = client_final_message_wo_proof,
+                                        client_proof = base64::encode(&client_proof));
+                                    println!("[sasl] client_final_message: {:?}\n", client_final_message);
+
+                                    protocol::SaslResponse { s: client_final_message }.encode(self.stream.buffer_mut());
+                                    self.stream.flush().await?;
+                                    let server_final_response = self.receive().await?;
+                                }
+                            }
                         }
 
                         auth => {

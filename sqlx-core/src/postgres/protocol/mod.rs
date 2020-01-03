@@ -15,6 +15,7 @@ mod flush;
 mod parse;
 mod password_message;
 mod query;
+mod sasl;
 mod startup_message;
 mod statement;
 mod sync;
@@ -30,6 +31,7 @@ pub use flush::Flush;
 pub use parse::Parse;
 pub use password_message::PasswordMessage;
 pub use query::Query;
+pub use sasl::{SaslInitialResponse, SaslResponse};
 pub use startup_message::StartupMessage;
 pub use statement::StatementId;
 pub use sync::Sync;
@@ -49,7 +51,9 @@ mod row_description;
 
 mod message;
 
+pub use authentication::hi;
 pub use authentication::Authentication;
+pub use authentication::SaslContinue;
 pub use backend_key_data::BackendKeyData;
 pub use command_complete::CommandComplete;
 pub use data_row::DataRow;
